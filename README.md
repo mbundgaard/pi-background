@@ -15,7 +15,7 @@ pi install npm:@comput/pi-background
 Alternatively, install the committed source from GitHub:
 
 ```bash
-pi install git:github.com/comput-sh/pi-background
+pi install git:github.com/mbundgaard/pi-background
 ```
 
 Start a new Pi session or run `/reload` after installation. Pi must be installed and authenticated. Workers launch the resolved Pi package's CLI directly through the current Node.js executable, without a shell. Node.js 20.3 or newer is required; development checks use Node.js 22 or 24. The source is validated against Pi 0.85.1.
@@ -144,7 +144,7 @@ Releases of `@comput/pi-background` publish automatically **only when a version 
 
 ### Trusted Publishing setup
 
-In npm's Trusted Publisher settings, configure GitHub Actions with owner `comput-sh`, repository `pi-background`, and workflow filename `publish.yml` (no GitHub environment). Existing configuration may already match. The workflow uses GitHub OIDC and provenance with `contents: read` and `id-token: write`, not a stored npm token.
+In npm's Trusted Publisher settings, configure GitHub Actions with owner `mbundgaard`, repository `pi-background`, and workflow filename `publish.yml` (no GitHub environment). Existing configuration may already match. The workflow uses GitHub OIDC and provenance with `contents: read` and `id-token: write`, not a stored npm token.
 
 ### Release procedure
 
