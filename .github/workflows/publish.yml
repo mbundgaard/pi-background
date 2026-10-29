@@ -47,7 +47,10 @@ jobs:
           npm pack --dry-run --json > "$RUNNER_TEMP/package-contents.json"
           node --input-type=module <<'NODE'
           import fs from 'node:fs';
-          const [pack] = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/package-contents.json`, 'utf8'));
+          const result = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/package-contents.json`, 'utf8'));
+          const packs = Array.isArray(result) ? result : Object.values(result);
+          if (packs.length !== 1 || packs[0].name !== '@comput/pi-background') throw new Error('Unexpected pack result');
+          const [pack] = packs;
           const paths = pack.files.map(file => file.path);
           for (const required of ['package.json', 'README.md', 'LICENSE', 'src/index.ts', 'src/runtime.ts', 'src/schedules.ts', 'src/worker.ts']) {
             if (!paths.includes(required)) throw new Error(`Missing package file: ${required}`);

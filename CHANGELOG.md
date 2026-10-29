@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2
+
+- Support both array and package-keyed object output from npm pack in the release content check.
+- Includes the 0.2.1 changes; 0.2.1 publication stopped before publishing because of this check.
+
 ## 0.2.1
 
 - Publish automatically from stable version-tag pushes, with exact-commit checkout and matching package/lockfile version checks.
