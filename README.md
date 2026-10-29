@@ -140,14 +140,35 @@ CI checks type safety, unit/integration tests, and package contents on Windows a
 
 ## Publishing
 
-This repository follows PiTelegram's public scoped-package and GitHub Actions Trusted Publishing approach. The intended npm name is `@comput/pi-background`; preparing this repository does not publish it.
+Releases of `@comput/pi-background` publish automatically **only when a version tag is pushed**. Ordinary commits and GitHub Release publication do not publish; manual dispatch is disabled. Obtain explicit authorization before committing, pushing, tagging, or publishing.
 
-1. Ensure you have publish access to the `@comput` npm scope. If npm requires an initial package publication before configuring a trusted publisher, bootstrap it from a trusted local machine with `npm publish --access public --provenance=false` after validation. Authenticate locally; never commit credentials.
-2. In the npm package's Trusted Publisher settings, select GitHub Actions and configure owner `comput-sh`, repository `pi-background`, workflow filename `publish.yml`. The workflow does not use a GitHub environment.
-3. Commit the source, metadata, and lockfile. For later versions, update both package files (for example, `npm version patch`).
-4. Publish a GitHub release tagged `v<package version>` (initially `v0.1.0`), or manually dispatch the publish workflow for an unpublished version.
+### Trusted Publishing setup
 
-The workflow validates the package and uses npm OIDC Trusted Publishing with public access and signed provenance, without an npm token secret. Release tags must match `package.json`. Already-published versions cannot be republished; if bootstrapping published `0.1.0`, increment the version before the first Actions publication.
+In npm's Trusted Publisher settings, configure GitHub Actions with owner `comput-sh`, repository `pi-background`, and workflow filename `publish.yml` (no GitHub environment). Existing configuration may already match. The workflow uses GitHub OIDC and provenance with `contents: read` and `id-token: write`, not a stored npm token.
+
+### Release procedure
+
+1. Review changes. Update `package.json`, both version fields in `package-lock.json` (for example, `npm version minor --no-git-tag-version`), and the changelog/release notes. Only stable `x.y.z` versions are supported.
+2. Run `npm ci`, `npm run validate` (typecheck and tests), `npm audit --audit-level=low`, and `npm run pack:check`. Review package contents: only package metadata, README, LICENSE, and TypeScript source should ship.
+3. Confirm the proposed version is unused on npm and its tag is absent locally and remotely. Check `npm view @comput/pi-background versions --json`, `git tag --list`, and `git ls-remote --tags origin`. Authentication or network errors are not proof of absence.
+4. With authorization, commit and push to `main`; verify CI passes for that exact release commit.
+5. Create an annotated tag pointing to that commit and push only that tag (replace the example values):
+
+   ```bash
+   git tag -a v1.2.3 <release-commit> -m "Release v1.2.3"
+   git push origin refs/tags/v1.2.3
+   ```
+
+The tag push starts `.github/workflows/publish.yml`. It checks out the triggering commit, verifies the tag exactly equals `v${package.json.version}` and both lockfile versions match, then runs a clean install, typecheck, tests, security audit, and package-content checks before publishing. Do not trigger a second publication.
+
+### Verify publication
+
+- Verify the publishing workflow succeeded for the tag's exact commit and npm exposes the expected version and dist-tag.
+- Download the published package into a temporary directory. Check its file list and compare extracted file hashes against the release commit, excluding nothing silently. Verify the downloaded tarball against npm's `dist.integrity` as well.
+- Inspect npm's provenance attestation and verify its repository, publishing workflow, and source commit match the release. Workflow success alone is not proof of artifact or provenance verification.
+- If status is uncertain, inspect the workflow and registry first; registry visibility may lag. Never blindly retry publication, move a release tag, or reuse a published version.
+
+Publishing does not install the extension or reload running Pi sessions. Installation and reload remain separate actions.
 
 ## License
 

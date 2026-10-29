@@ -1,9 +1,9 @@
 name: Publish npm package
 
 on:
-  release:
-    types: [published]
-  workflow_dispatch:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
 
 permissions:
   contents: read
@@ -14,19 +14,50 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@v6
         with:
           node-version: 24
           package-manager-cache: false
       - run: npm install --global npm@latest
+      - name: Validate stable release tag and lockfile versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
+          if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(pkg.version)) {
+            throw new Error('Only stable x.y.z versions are supported');
+          }
+          if (process.env.RELEASE_TAG !== `v${pkg.version}` ||
+              lock.version !== pkg.version || lock.packages?.['']?.version !== pkg.version) {
+            throw new Error('Tag, package version, and both lockfile versions must match');
+          }
+          NODE
       - run: npm ci
       - run: npm run validate
+      - run: npm audit --audit-level=low
       - run: npm run pack:check
-      - name: Check release tag matches package version
-        if: github.event_name == 'release'
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: node --input-type=module -e "import fs from 'node:fs'; const {version} = JSON.parse(fs.readFileSync('package.json', 'utf8')); if (process.env.RELEASE_TAG !== 'v' + version) throw new Error('Release tag must be v' + version);"
+      - name: Check package contents
+        run: |
+          npm pack --dry-run --json > "$RUNNER_TEMP/package-contents.json"
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const [pack] = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/package-contents.json`, 'utf8'));
+          const paths = pack.files.map(file => file.path);
+          for (const required of ['package.json', 'README.md', 'LICENSE', 'src/index.ts', 'src/runtime.ts', 'src/schedules.ts', 'src/worker.ts']) {
+            if (!paths.includes(required)) throw new Error(`Missing package file: ${required}`);
+          }
+          for (const path of paths) {
+            if (!['package.json', 'README.md', 'LICENSE'].includes(path) && !/^src\/.*\.ts$/.test(path)) {
+              throw new Error(`Unexpected package file: ${path}`);
+            }
+          }
+          NODE
       - name: Publish through npm Trusted Publishing
         shell: bash
         run: |
