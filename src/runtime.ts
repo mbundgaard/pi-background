@@ -1,7 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { runScript } from "./script.js";
 import type { BgTask, ownedTasks, readTaskResult, acknowledgeTask, changeSchedules, startBackgroundPi } from "./index.js";
 import { consumeDue, createSchedule, type Schedule } from "./schedules.js";
+import { PAUSE_REQUEST_EVENT, PAUSE_RESULT_EVENT, parsePausedUntil, type PauseRequest, type PauseResult } from "./pause.js";
 
 interface Dependencies {
   child: boolean;
@@ -27,10 +29,12 @@ interface Active {
   prompting: boolean;
   lastWarning: number;
   cancelled: Set<string>;
+  pausedUntil?: number;
 }
 
 export function registerRuntime(pi: ExtensionAPI, deps: Dependencies) {
   let active: Active | undefined;
+  const runningScripts = new Set<string>();
   const guard = (ctx: ExtensionContext) => {
     const captured = active;
     const sessionId = ctx.sessionManager.getSessionId();
@@ -41,6 +45,21 @@ export function registerRuntime(pi: ExtensionAPI, deps: Dependencies) {
     if (!guard(ctx)()) throw new Error("No active owning main session");
     return ctx.sessionManager.getSessionId();
   };
+  const paused = (a: Active) => a.pausedUntil !== undefined && Date.now() < a.pausedUntil;
+  const setPause = (a: Active, value: unknown) => {
+    const timestamp = parsePausedUntil(value);
+    a.pausedUntil = timestamp;
+    return { sessionId: a.sessionId, pausedUntil: timestamp === undefined ? null : new Date(timestamp).toISOString() };
+  };
+  pi.events.on(PAUSE_REQUEST_EVENT, (value: unknown) => {
+    if (!value || typeof value !== "object" || deps.child || !active) return;
+    const request = value as PauseRequest;
+    if (request.sessionId !== active.sessionId || typeof request.requestId !== "string" || !request.requestId.trim() || request.requestId.length > 128) return;
+    let response: PauseResult;
+    try { response = { requestId: request.requestId, ok: true, ...setPause(active, request.pausedUntil) }; }
+    catch { response = { requestId: request.requestId, sessionId: active.sessionId, ok: false, error: "Invalid pausedUntil; existing pause unchanged" }; }
+    pi.events.emit(PAUSE_RESULT_EVENT, response);
+  });
   const idle = (a: Active) => active === a && !a.prompting && a.ctx.isIdle() && !a.ctx.hasPendingMessages();
   const warn = (a: Active, error: unknown) => {
     if (active !== a || Date.now() - a.lastWarning < 60_000) return;
@@ -52,6 +71,7 @@ export function registerRuntime(pi: ExtensionAPI, deps: Dependencies) {
     if (active !== a || a.pumping) return;
     a.pumping = true;
     const mainWasIdle = idle(a);
+    const wasPaused = paused(a);
     try {
       const tasks = await deps.ownedTasks(a.ctx.cwd, a.sessionId);
       if (active !== a) return;
@@ -71,7 +91,9 @@ export function registerRuntime(pi: ExtensionAPI, deps: Dependencies) {
         let taskId: string | undefined;
         let error: string | undefined;
         try {
-          if (a.cancelled.has(schedule.id)) {
+          if (wasPaused || paused(a)) {
+            outcome = "skipped-paused";
+          } else if (a.cancelled.has(schedule.id)) {
             outcome = "skipped-cancelled";
           } else if (Date.now() - schedule.nextAt > 1500) {
             outcome = "skipped-missed";
@@ -82,21 +104,52 @@ export function registerRuntime(pi: ExtensionAPI, deps: Dependencies) {
               mainDispatched = true;
               outcome = "dispatched";
             }
+          } else if (schedule.target === "script") {
+            const key = `${a.ctx.cwd}:${a.sessionId}:${schedule.id}`;
+            if (runningScripts.has(key)) {
+              outcome = "skipped-overlap";
+            } else {
+              runningScripts.add(key);
+              outcome = "started";
+              void runScript({ ...schedule, scriptPath: schedule.scriptPath! }, a.ctx.cwd,
+                () => active === a && !paused(a) && !a.cancelled.has(schedule.id) && Date.now() - schedule.nextAt <= 1500)
+                .then(value => {
+                  // Only session lifetime/identity is checked: pause, stderr, exit status,
+                  // schedule deletion and busy state must NEVER suppress nonempty stdout.
+                  if (active !== a) return;
+                  if (value.stdout.length > 0) {
+                    if (a.ctx.isIdle()) pi.sendUserMessage(value.stdout);
+                    else pi.sendUserMessage(value.stdout, { deliverAs: "steer" });
+                  }
+                  if (value.diagnostic) warn(a, value.diagnostic);
+                })
+                .catch(() => warn(a, "Script execution or stdout delivery failed; not retried"))
+                .finally(() => runningScripts.delete(key));
+            }
           } else if (tasks.some(t => t.scheduleId === schedule.id && t.state === "running")) {
             outcome = "skipped-overlap";
           } else {
             const task = await deps.startBackgroundPi(schedule, a.ctx,
-              () => active === a && !a.cancelled.has(schedule.id) && Date.now() - schedule.nextAt <= 1500, schedule.id);
+              () => active === a && !paused(a) && !a.cancelled.has(schedule.id) && Date.now() - schedule.nextAt <= 1500, schedule.id);
             tasks.push(task);
             taskId = task.id;
             outcome = "started";
           }
-        } catch (e) { outcome = "failed"; error = String(e); }
+        } catch (e) {
+          if (paused(a)) outcome = "skipped-paused";
+          else { outcome = "failed"; error = String(e); }
+        }
         // Persist history even if session closed during a worker spawn. Never retry dispatch.
         await deps.changeSchedules(a.ctx.cwd, schedules => {
           const stored = schedules.find(s => s.id === schedule.id && s.ownerSessionId === a.sessionId);
           if (stored) stored.lastRun = { at: new Date().toISOString(), outcome, taskId, error };
         });
+      }
+      // Drop automatic notifications observed during a pause, not the results themselves.
+      // Reuse activation-local bookkeeping: no persistent acknowledgments or catch-up queue.
+      if (wasPaused || paused(a)) {
+        for (const task of tasks) if (task.state !== "running" && !task.acknowledgedAtUtc) a.notified.add(task.id);
+        return;
       }
       if (mainDispatched || !idle(a)) return;
       const unread = tasks.filter(t => t.state !== "running" && !t.acknowledgedAtUtc && !a.notified.has(t.id)).slice(0, 10);
@@ -106,6 +159,7 @@ export function registerRuntime(pi: ExtensionAPI, deps: Dependencies) {
         if (task.resultPath && task.state !== "stale") answer = (await deps.readTaskResult(task)).finalAnswer.slice(0, 400);
         return { id: task.id, name: task.name.slice(0, 200), status: task.state, summary: answer, error: task.error?.slice(0, 500) };
       }));
+      if (paused(a)) { for (const task of unread) a.notified.add(task.id); return; }
       if (!idle(a)) return;
       // Only the live owner sends. Completions never use a captured, stale Pi API.
       pi.sendMessage({ customType: "background-inbox", display: true,
@@ -140,6 +194,16 @@ export function registerRuntime(pi: ExtensionAPI, deps: Dependencies) {
   pi.on("agent_settled", async () => { if (active) void pump(active); });
   pi.on("ui_prompt_start", async () => { if (active) active.prompting = true; });
   pi.on("ui_prompt_end", async () => { if (active) active.prompting = false; });
+
+  pi.registerTool({
+    name: "bg_pause", label: "Pause Automatic Background Activity",
+    description: "Set this session's in-memory pausedUntil absolute ISO timestamp with timezone. Null or empty clears it. Future: skip scheduled launches and automatic completion notifications; past or empty: normal behavior. Skipped triggers are discarded, not replayed. Running workers and manual tools are unaffected; results remain in the inbox. Stdout from already-started scripts is delivered even while paused. Reload/restart clears the pause.",
+    parameters: Type.Object({ pausedUntil: Type.Union([Type.String(), Type.Null()]) }),
+    async execute(_id, p, _signal, _update, ctx) {
+      requireOwner(ctx);
+      return result(setPause(active!, p.pausedUntil));
+    },
+  });
 
   pi.registerTool({
     name: "bg_inbox", label: "Background Result Inbox",
@@ -179,11 +243,14 @@ export function registerRuntime(pi: ExtensionAPI, deps: Dependencies) {
 
   pi.registerTool({
     name: "bg_schedule_create", label: "Create Session Schedule",
-    description: "Create a session-owned one-shot or fixed-interval schedule targeting main or background. Runs only while this main session is open. Busy main, overlapping workers, closed-session and missed triggers are skipped, never queued. No cron support.",
-    promptSnippet: "Schedule main or background work without execution backlogs.",
+    description: "Create a session-owned one-shot or fixed-interval schedule targeting main, background, or script. Script runs python3 with an absolute scriptPath, optional args and envFiles, no shell, in the project cwd. Nonempty stdout is sent unchanged to main (steer when busy), even on nonzero exit or pause during execution; empty stdout sends nothing. Runs only while this main session is open. Overlapping runs and missed triggers are skipped, never retried. No cron support.",
+    promptSnippet: "Schedule main, background, or Python script work without execution backlogs.",
     promptGuidelines: ["Use bg_schedule_create only when the user asks for future or recurring work. Missed runs are discarded; background results remain in bg_inbox."],
-    parameters: Type.Object({ name: Type.String({ maxLength: 200 }), prompt: Type.String({ maxLength: 32000 }),
-      target: Type.String({ enum: ["main", "background"] }), when: Type.String({ description: "Future ISO time with timezone, or +10m / +30s / +1h / +1d" }),
+    parameters: Type.Object({ name: Type.String({ maxLength: 200 }), prompt: Type.Optional(Type.String({ maxLength: 32000, description: "Required for main/background; omit for script." })),
+      target: Type.String({ enum: ["main", "background", "script"] }), when: Type.String({ description: "Future ISO time with timezone, or +10m / +30s / +1h / +1d" }),
+      scriptPath: Type.Optional(Type.String({ description: "Absolute Python script path; required for script target." })),
+      args: Type.Optional(Type.Array(Type.String())),
+      envFiles: Type.Optional(Type.Record(Type.String(), Type.String({ description: "Absolute file path; read each run into this child-only environment variable, removing one trailing LF or CRLF." }))),
       intervalSeconds: Type.Optional(Type.Number({ minimum: 1, maximum: 31536000 })),
       timeoutSeconds: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 2147483 })),
       model: Type.Optional(Type.String()), provider: Type.Optional(Type.String()), thinking: Type.Optional(Type.String()) }),

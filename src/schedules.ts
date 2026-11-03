@@ -1,12 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { validateScript } from "./script.js";
 
 export interface Schedule {
   id: string;
   ownerSessionId: string;
   name: string;
   prompt: string;
-  target: "main" | "background";
+  target: "main" | "background" | "script";
+  scriptPath?: string;
+  args?: string[];
+  envFiles?: Record<string, string>;
   nextAt: number;
   intervalMs?: number;
   enabled: boolean;
@@ -19,8 +23,11 @@ export interface Schedule {
 
 export interface ScheduleInput {
   name: string;
-  prompt: string;
+  prompt?: string;
   target: string;
+  scriptPath?: string;
+  args?: string[];
+  envFiles?: Record<string, string>;
   when: string;
   intervalSeconds?: number;
   timeoutSeconds?: number;
@@ -30,8 +37,14 @@ export interface ScheduleInput {
 }
 
 export function createSchedule(input: ScheduleInput, sessionId: string, now = Date.now()): Schedule {
-  if (!input.name.trim() || !input.prompt.trim()) throw new Error("Schedule name and prompt are required");
-  if (input.target !== "main" && input.target !== "background") throw new Error("Target must be main or background");
+  if (!input.name.trim() || (input.target !== "script" && !input.prompt?.trim())) throw new Error("Schedule name and prompt are required for main/background");
+  if (input.target !== "main" && input.target !== "background" && input.target !== "script") throw new Error("Target must be main, background or script");
+  if (input.target === "script") {
+    validateScript({ ...input, scriptPath: input.scriptPath! });
+    if ([input.model, input.provider, input.thinking, input.prompt].some(v => v !== undefined)) throw new Error("Script schedules do not accept Pi prompt/model options");
+  } else if ([input.scriptPath, input.args, input.envFiles].some(v => v !== undefined)) {
+    throw new Error("scriptPath, args and envFiles are script-only");
+  }
   const relative = /^\+(\d+(?:\.\d+)?)(s|m|h|d)$/.exec(input.when);
   const units: Record<string, number> = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
   const nextAt = relative ? now + Number(relative[1]) * units[relative[2]]
@@ -48,7 +61,8 @@ export function createSchedule(input: ScheduleInput, sessionId: string, now = Da
   }
   return {
     id: `schedule_${randomUUID()}`, ownerSessionId: sessionId,
-    name: input.name.trim(), prompt: input.prompt, target: input.target, nextAt,
+    name: input.name.trim(), prompt: input.prompt ?? "", target: input.target, nextAt,
+    scriptPath: input.scriptPath, args: input.args, envFiles: input.envFiles,
     intervalMs: input.intervalSeconds === undefined ? undefined : input.intervalSeconds * 1000,
     enabled: true, timeoutSeconds: input.timeoutSeconds, model: input.model,
     provider: input.provider, thinking: input.thinking,
@@ -83,9 +97,15 @@ export async function readSchedules(path: string): Promise<Schedule[]> {
   for (const s of data.schedules) {
     if (!s || typeof s.id !== "string" || ids.has(s.id) || typeof s.ownerSessionId !== "string"
       || typeof s.name !== "string" || typeof s.prompt !== "string" || typeof s.enabled !== "boolean"
-      || !["main", "background"].includes(s.target) || !Number.isFinite(s.nextAt)
+      || !["main", "background", "script"].includes(s.target) || !Number.isFinite(s.nextAt)
       || (s.intervalMs !== undefined && (!Number.isFinite(s.intervalMs) || s.intervalMs < 1000))) {
       throw new Error("Invalid schedule record; refusing to execute");
+    }
+    if (s.target === "script") {
+      validateScript(s);
+      if (s.timeoutSeconds !== undefined && (!Number.isFinite(s.timeoutSeconds) || s.timeoutSeconds <= 0 || s.timeoutSeconds > 2_147_483)) {
+        throw new Error("Invalid script timeout");
+      }
     }
     ids.add(s.id);
   }

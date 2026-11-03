@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { EventEmitter } from "node:events";
+import { PAUSE_REQUEST_EVENT, PAUSE_RESULT_EVENT } from "../src/pause.ts";
 import { registerRuntime } from "../src/runtime.ts";
 import { createSchedule, type Schedule } from "../src/schedules.ts";
 
@@ -8,9 +10,13 @@ function harness(child = false) {
   const schedules: Schedule[] = [], tasks: any[] = [], notifications: any[] = [], dispatched: any[] = [], started: any[] = [];
   let owner = "session-a", idle = true, pending = false;
   let beforeTasks: (() => Promise<void>) | undefined;
+  let beforeResult: (() => Promise<void>) | undefined;
+  let beforeSpawn: (() => Promise<void>) | undefined;
+  const events = new EventEmitter();
   const ctx: any = { cwd: "project", sessionManager: { getSessionId: () => owner },
     isIdle: () => idle, hasPendingMessages: () => pending, ui: { notify() {} } };
   const pi: any = {
+    events: { on(name: string, fn: (...args: any[]) => void) { events.on(name, fn); return () => events.off(name, fn); }, emit(name: string, value: unknown) { events.emit(name, value); } },
     on(name: string, fn: Function) { handlers.set(name, [...(handlers.get(name) ?? []), fn]); },
     registerTool(tool: any) { tools.set(tool.name, tool); },
     sendUserMessage(text: string, options: any) { dispatched.push({ text, options }); },
@@ -19,7 +25,7 @@ function harness(child = false) {
   const runtime = registerRuntime(pi, {
     child,
     async ownedTasks(_cwd, sessionId) { if (beforeTasks) await beforeTasks(); return structuredClone(tasks.filter(t => t.origin.sessionId === sessionId)); },
-    async readTaskResult() { return { status: "completed", finalAnswer: "answer", exitCode: 0, signal: null }; },
+    async readTaskResult() { if (beforeResult) await beforeResult(); return { status: "completed", finalAnswer: "answer", exitCode: 0, signal: null }; },
     async acknowledgeTask(_cwd, sessionId, id) {
       const t = tasks.find(t => t.id === id && t.origin.sessionId === sessionId);
       if (!t) throw new Error("Not owned");
@@ -27,6 +33,7 @@ function harness(child = false) {
     },
     async changeSchedules(_cwd, fn) { return fn(schedules); },
     async startBackgroundPi(p, _ctx, alive, scheduleId) {
+      if (beforeSpawn) await beforeSpawn();
       assert.ok(alive?.());
       const task: any = { id: `task-${started.length}`, name: p.name, state: "running", scheduleId,
         origin: { sessionId: owner } };
@@ -39,7 +46,9 @@ function harness(child = false) {
     const s = createSchedule({ name: "check", prompt: "do work", target, when: "+1h" }, owner);
     s.nextAt = Date.now() - 10; schedules.push(s); return s;
   };
-  return { runtime, ctx, schedules, tasks, notifications, dispatched, started, emit, call, addDue,
+  return { runtime, ctx, schedules, tasks, notifications, dispatched, started, emit, call, addDue, events,
+    setBeforeResult(fn: () => Promise<void>) { beforeResult = fn; },
+    setBeforeSpawn(fn: () => Promise<void>) { beforeSpawn = fn; },
     setIdle(value: boolean) { idle = value; }, setPending(value: boolean) { pending = value; },
     setOwner(value: string) { owner = value; }, setBeforeTasks(fn: () => Promise<void>) { beforeTasks = fn; } };
 }
@@ -174,4 +183,88 @@ test("schedule create, pause, enable, list and delete stay session scoped", asyn
     await h.call("bg_schedule_delete", { scheduleId: s.id });
     assert.equal(h.schedules.length, 0);
   } finally { await h.emit("session_shutdown"); }
+});
+
+test("pause rule: null, empty, past and exactly now fire; future skips both targets", async t => {
+  const now = Date.parse("2030-01-01T12:00:00Z"); t.mock.method(Date, "now", () => now);
+  for (const pausedUntil of [null, "", new Date(now - 1).toISOString(), new Date(now).toISOString(), new Date(now + 1800000).toISOString()]) {
+    const h = harness(); await h.emit("session_start");
+    try {
+      await h.call("bg_pause", { pausedUntil }); const main = h.addDue(), worker = h.addDue("background");
+      await h.runtime.poll(); const future = typeof pausedUntil === "string" && Date.parse(pausedUntil) > now;
+      assert.equal(h.dispatched.length, future ? 0 : 1); assert.equal(h.started.length, future ? 0 : 1);
+      if (future) {
+        assert.equal(main.lastRun?.outcome, "skipped-paused"); assert.equal(worker.lastRun?.outcome, "skipped-paused");
+        await h.call("bg_pause", { pausedUntil: null }); await h.runtime.poll();
+        assert.equal(h.dispatched.length, 0); assert.equal(h.started.length, 0);
+      }
+    } finally { await h.emit("session_shutdown"); }
+  }
+});
+
+test("paused completion notifications are dropped, results/manual inbox and running workers preserved", async () => {
+  const h = harness(); await h.emit("session_start");
+  try {
+    h.tasks.push({ id: "done", name: "done", state: "completed", origin: { sessionId: "session-a" }, resultPath: "result" },
+      { id: "running", name: "running", state: "running", origin: { sessionId: "session-a" } });
+    await h.call("bg_pause", { pausedUntil: new Date(Date.now() + 60000).toISOString() });
+    await h.runtime.poll(); assert.equal(h.notifications.length, 0); assert.equal(h.tasks[1].state, "running");
+    const read = await h.call("bg_inbox", { action: "get", taskId: "done" }); assert.match(read.content[0].text, /answer/);
+    assert.equal(h.tasks[0].acknowledgedAtUtc, undefined);
+    await h.call("bg_pause", { pausedUntil: null }); await h.runtime.poll(); assert.equal(h.notifications.length, 0);
+    h.tasks[1].state = "completed"; await h.runtime.poll(); assert.equal(h.notifications.length, 1);
+  } finally { await h.emit("session_shutdown"); }
+});
+
+test("event pause has explicit acknowledgment, exact session scope and invalid-input safety", async () => {
+  const h = harness(); await h.emit("session_start"); const replies: any[] = [];
+  h.events.on(PAUSE_RESULT_EVENT, value => replies.push(value));
+  try {
+    const pausedUntil = new Date(Date.now() + 60000).toISOString();
+    h.events.emit(PAUSE_REQUEST_EVENT, { requestId: "one", sessionId: "session-a", pausedUntil });
+    assert.deepEqual(replies[0], { requestId: "one", sessionId: "session-a", ok: true, pausedUntil });
+    h.events.emit(PAUSE_REQUEST_EVENT, { requestId: "foreign", sessionId: "session-b", pausedUntil: null }); assert.equal(replies.length, 1);
+    h.events.emit(PAUSE_REQUEST_EVENT, { requestId: "bad", sessionId: "session-a", pausedUntil: "+30m" }); assert.equal(replies[1].ok, false);
+    await assert.rejects(h.call("bg_pause", { pausedUntil: "tomorrow" }));
+    const due = h.addDue(); await h.runtime.poll(); assert.equal(due.lastRun?.outcome, "skipped-paused");
+    h.events.emit(PAUSE_REQUEST_EVENT, { requestId: "clear", sessionId: "session-a", pausedUntil: "" }); assert.equal(replies[2].pausedUntil, null);
+    h.addDue(); await h.runtime.poll(); assert.equal(h.dispatched.length, 1);
+  } finally { await h.emit("session_shutdown"); }
+});
+
+test("expiry resumes fresh triggers without backlog and reload clears pause", async t => {
+  let now = Date.parse("2030-01-01T12:00:00Z"); t.mock.method(Date, "now", () => now);
+  const h = harness(); await h.emit("session_start");
+  try {
+    await h.call("bg_pause", { pausedUntil: new Date(now + 1000).toISOString() });
+    const s = h.addDue(); s.intervalMs = 10000; await h.runtime.poll(); assert.equal(s.lastRun?.outcome, "skipped-paused");
+    now += 1000; await h.runtime.poll(); assert.equal(h.dispatched.length, 0);
+    now = s.nextAt; await h.runtime.poll(); assert.equal(h.dispatched.length, 1);
+    await h.call("bg_pause", { pausedUntil: new Date(now + 60000).toISOString() });
+    await h.emit("session_shutdown"); await h.emit("session_start"); h.addDue(); await h.runtime.poll(); assert.equal(h.dispatched.length, 2);
+  } finally { await h.emit("session_shutdown"); }
+});
+
+test("pause is rechecked after IO and before background spawn or notification", async () => {
+  for (const phase of ["tasks", "result", "spawn"]) {
+    const h = harness(); await h.emit("session_start");
+    try {
+      const pause = async () => { await h.call("bg_pause", { pausedUntil: new Date(Date.now() + 60000).toISOString() }); };
+      if (phase === "tasks") { h.addDue(); h.setBeforeTasks(pause); }
+      if (phase === "spawn") { h.addDue("background"); h.setBeforeSpawn(pause); }
+      if (phase === "result") { h.tasks.push({ id: "done", state: "completed", origin: { sessionId: "session-a" }, resultPath: "result", name: "done" }); h.setBeforeResult(pause); }
+      await h.runtime.poll(); assert.equal(h.dispatched.length, 0); assert.equal(h.started.length, 0); assert.equal(h.notifications.length, 0);
+      if (phase === "spawn") assert.equal(h.schedules[0].lastRun?.outcome, "skipped-paused");
+    } finally { await h.emit("session_shutdown"); }
+  }
+});
+
+test("children cannot pause and no event reply is emitted without a matching active owner", async () => {
+  for (const child of [false, true]) {
+    const h = harness(child); const replies: unknown[] = []; h.events.on(PAUSE_RESULT_EVENT, x => replies.push(x));
+    if (child) await h.emit("session_start");
+    h.events.emit(PAUSE_REQUEST_EVENT, { requestId: "x", sessionId: "session-a", pausedUntil: null });
+    assert.equal(replies.length, 0); await assert.rejects(h.call("bg_pause", { pausedUntil: null }));
+    await h.emit("session_shutdown");
+  }
 });

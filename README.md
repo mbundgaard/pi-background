@@ -2,7 +2,7 @@
 
 Run background [Pi coding-agent](https://github.com/earendil-works/pi-mono) tasks, review their results in a durable session inbox, and schedule main or background work without execution backlogs.
 
-**Version 0.2.0:** adds durable result inbox and session-owned scheduling. npm `0.1.0` provides the original `bg_start` behavior.
+**Version 0.3.0:** adds session-owned Python script schedules and an optional in-memory session pause. Durable result inbox and main/background scheduling remain available; npm `0.1.0` provides the original `bg_start` behavior.
 
 ## Install
 
@@ -18,7 +18,7 @@ Alternatively, install the committed source from GitHub:
 pi install git:github.com/mbundgaard/pi-background
 ```
 
-Start a new Pi session or run `/reload` after installation. Pi must be installed and authenticated. Workers launch the resolved Pi package's CLI directly through the current Node.js executable, without a shell. Node.js 20.3 or newer is required; development checks use Node.js 22 or 24. The source is validated against Pi 0.85.1.
+Start a new Pi session or run `/reload` after installation. Pi must be installed and authenticated. Workers launch the resolved Pi package's CLI directly through the current Node.js executable, without a shell. Node.js 20.3 or newer is required; development checks use Node.js 22 or 24. Development validation uses Pi 1.4.0.
 
 The package ships TypeScript source, loaded directly by Pi; there is no build step or standalone executable.
 
@@ -90,6 +90,30 @@ Use `bg_schedule_create` with these arguments. Omit `intervalSeconds` for a one-
 | `bg_schedule_enable` | Pause or enable using `scheduleId` and `enabled` |
 | `bg_schedule_delete` | Delete a schedule; already-started tasks and saved results remain |
 
+### Python script target
+
+Use `target: "script"` to run `python3` directly, without a shell or Pi worker:
+
+```json
+{
+  "name": "check-alerts",
+  "target": "script",
+  "scriptPath": "/home/me/project/check_alerts.py",
+  "args": ["--mode", "scheduled"],
+  "envFiles": { "API_TOKEN": "/home/me/.secrets/api-token" },
+  "when": "+1m",
+  "intervalSeconds": 300
+}
+```
+
+`scriptPath` must be absolute. `args` is an optional string array; `envFiles` maps environment variable names to absolute file paths. Each execution rereads those files into a copy of the parent environment for that child only. Exactly one trailing LF or CRLF is removed; all other contents are preserved. File rotation takes effect on the next run. The working directory is the project directory. `python3` must be on PATH. Omit `prompt`, `model`, `provider`, and `thinking`; an optional `timeoutSeconds` requests child termination.
+
+**Output contract:** nonempty captured stdout is sent as exactly one unchanged user message to the owning session: ordinary delivery when idle, `deliverAs: "steer"` when busy. Whitespace-only output counts. Empty stdout sends nothing. There is no trimming, wrapping, filtering, truncation, retry or exit-code condition. Nonzero exit, stderr, disabling/deleting the schedule, or a pause applied after execution begins do not suppress stdout. A pause can still prevent execution before spawn, including during environment-file reads.
+
+Scripts from the same schedule do not overlap within the runtime; overlapping triggers are consumed and skipped. Scripts do not enter `bg_inbox`. Read/spawn failures and exit/stderr diagnostics produce generic local warnings, never environment file or stderr contents. Stdout is deliberately unrestricted: scripts must not print secrets unless those secrets are intended for the model/session transcript. Output is held in memory until process close, so keep it appropriately sized and UTF-8 encoded. Scripts have the user's permissions and inherited environment; this is not a sandbox.
+
+Delivery is live-session-only: closing/replacing/reloading the owning runtime prevents stale callbacks from injecting into another session, and there is no durable script-output replay. Finish scripts before reload to retain delivery and overlap tracking. Running scripts are not cancelled by a schedule deletion or session pause.
+
 ### No queueing or catch-up
 
 - Schedules run only while their owning main session is open in this project. No daemon or independent scheduler process is started.
@@ -102,6 +126,51 @@ Use `bg_schedule_create` with these arguments. Omit `intervalSeconds` for a one-
 - Only resume an owning session in one process at a time. Separate sessions can each have their own schedules.
 
 These tools are provided by Pi Background itself and do not depend on other scheduling or inter-agent extensions.
+
+## Optional temporary pause
+
+`bg_pause` sets one **in-memory, session-local** `pausedUntil` timestamp. It is unset by default; users who never request a pause get unchanged behavior. No other integration is required.
+
+```json
+{ "pausedUntil": "2030-01-01T12:30:00Z" }
+```
+
+- `null` or `""`: clear the pause; fire normally.
+- Timestamp in the past or exactly now: fire normally.
+- Timestamp in the future: skip automatic activity.
+
+Use an absolute ISO timestamp with an explicit timezone, not a duration. Each valid request **replaces** the value. There is no default duration, pause file, deferred queue or automatic early resume. Session shutdown/start, reload and restart clear it.
+
+The pause applies to scheduled launches targeting **main, background, and script**, and automatic background-worker completion notifications. It never gates stdout delivery from an already-started script. Due schedules observed while paused are consumed as `skipped-paused`, not replayed when the pause expires. Script history records dispatch rather than confirmed process execution: a pause during environment-file reads can prevent spawning after history records `started`. Completion notifications observed during a paused poll are dropped for that activation, not queued for later delivery. Their results remain unacknowledged in `bg_inbox`; normal reload behavior can announce unread results again. Already-running workers continue. Explicit manual tools (`bg_start`, inbox access and schedule management) remain available.
+
+### Direct extension interface
+
+Another extension in the same Pi session can request the same operation through `pi.events`, without a model turn or conversation message. Register the response listener **before emitting**; the acknowledgment can be synchronous.
+
+Request channel: **`pi-background:pause`**
+
+```ts
+{
+  requestId: "unique-correlation-id",
+  sessionId: ctx.sessionManager.getSessionId(),
+  pausedUntil: "2030-01-01T12:30:00Z" // or null / "" to clear
+}
+```
+
+Response channel: **`pi-background:pause:result`**
+
+```ts
+{
+  requestId: "unique-correlation-id",
+  sessionId: "the-matching-session-id",
+  ok: true,
+  pausedUntil: "2030-01-01T12:30:00.000Z" // normalized UTC, or null
+}
+```
+
+Invalid timestamps produce `ok: false` with a generic `error`, without changing the previous pause. Requests with a missing/blank/oversized request ID, a different session ID, no active main owner, or a child runtime are ignored. Correlate both IDs and require an acknowledgment; emitting alone does not prove a compatible background extension is installed. An acknowledgment means the timestamp was applied, not that existing workers were cancelled.
+
+This is a small cooperative in-process API, not an access-control boundary. The background extension knows only the supplied timestamp, never the requesting extension's reason. No changes to its normal scheduling behavior occur unless a future pause is set.
 
 ## Local data and limitations
 
@@ -127,6 +196,7 @@ Add `.pi/background/` to your project's `.gitignore`. These files may contain se
 ```bash
 npm ci
 npm run validate
+npm audit --audit-level=low
 npm run pack:check
 ```
 
@@ -136,7 +206,7 @@ Try the checkout in Pi:
 pi -e .
 ```
 
-CI checks type safety, unit/integration tests, and package contents on Windows and Linux with Node.js 22 and 24. Tests cover result parsing, spawn failures, timeouts, inbox recovery/ownership, concurrent storage updates, and scheduler lifecycle/skip behavior without making model calls. Only source, package metadata, this README, and the license are published.
+CI checks type safety, unit/integration tests, and package contents on Windows and Linux with Node.js 22 and 24. Tests cover result parsing, spawn failures, timeouts, inbox recovery/ownership, concurrent storage updates, scheduler lifecycle/skip behavior, session pauses, and Python script output/delivery without making model calls. Real-Python tests require `python3` on PATH and are skipped when it is unavailable. Only source, package metadata, this README, and the license are published.
 
 ## Publishing
 
